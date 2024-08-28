@@ -34,22 +34,26 @@ use std::{
     ptr::{self, NonNull},
     sync::Arc,
 };
-use windows_sys::Win32::Security::Cryptography::{
-    CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChainEngine,
-    CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-};
 use windows_sys::Win32::{
     Foundation::{
         BOOL, CERT_E_CN_NO_MATCH, CERT_E_EXPIRED, CERT_E_INVALID_NAME, CERT_E_UNTRUSTEDROOT,
         CERT_E_WRONG_USAGE, CRYPT_E_REVOKED, FILETIME, TRUE,
     },
     Security::Cryptography::{
-        CertCloseStore, CertFreeCertificateChainEngine, CERT_CHAIN_ENGINE_CONFIG,
+        CertAddEncodedCertificateToStore, CertAddStoreToCollection, CertCloseStore,
+        CertEnumCertificatesInStore, CertFreeCertificateChain, CertFreeCertificateChainEngine,
+        CertFreeCertificateContext, CertGetCertificateChain, CertGetNameStringW, CertOpenStore,
+        CertOpenSystemStoreW, CertSetCertificateContextProperty, CertVerifyCertificateChainPolicy,
+        HTTPSPolicyCallbackData, AUTHTYPE_SERVER, CERT_CHAIN_CACHE_END_CERT, CERT_CHAIN_CONTEXT,
+        CERT_CHAIN_ENGINE_CONFIG, CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS,
+        CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS,
         CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT, CERT_CHAIN_REVOCATION_CHECK_END_CERT,
-        CERT_CONTEXT, CERT_OCSP_RESPONSE_PROP_ID, CERT_SET_PROPERTY_IGNORE_PERSIST_ERROR_FLAG,
-        CERT_STORE_ADD_ALWAYS, CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG, CERT_STORE_PROV_MEMORY,
-        CERT_STRONG_SIGN_PARA, CERT_USAGE_MATCH, CRYPT_INTEGER_BLOB, CTL_USAGE,
-        USAGE_MATCH_TYPE_AND, X509_ASN_ENCODING,
+        CERT_CONTEXT, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_OCSP_RESPONSE_PROP_ID,
+        CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG, CERT_SET_PROPERTY_IGNORE_PERSIST_ERROR_FLAG,
+        CERT_STORE_ADD_ALWAYS, CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
+        CERT_STORE_PROV_COLLECTION, CERT_STORE_PROV_MEMORY, CERT_STRONG_SIGN_PARA,
+        CERT_USAGE_MATCH, CRYPT_INTEGER_BLOB, CTL_USAGE, PKCS_7_ASN_ENCODING, USAGE_MATCH_TYPE_AND,
+        X509_ASN_ENCODING,
     },
 };
 
@@ -75,8 +79,6 @@ struct CERT_CHAIN_PARA {
 }
 
 use crate::verification::invalid_certificate;
-#[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
-use windows_sys::Win32::Security::Cryptography::CERT_CHAIN_ENGINE_CONFIG;
 
 // SAFETY: see method implementation
 unsafe impl ZeroedWithSize for CERT_CHAIN_PARA {
@@ -109,7 +111,6 @@ unsafe impl ZeroedWithSize for CERT_CHAIN_POLICY_PARA {
     }
 }
 
-#[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
 // SAFETY: see method implementation
 unsafe impl ZeroedWithSize for CERT_CHAIN_ENGINE_CONFIG {
     fn zeroed_with_size() -> Self {
@@ -270,6 +271,66 @@ impl CertificateStore {
     fn engine_ptr(&self) -> isize {
         #[allow(clippy::as_conversions)]
         self.engine.map(|e| e.as_ptr() as isize).unwrap_or(0)
+    }
+
+    fn new_with_extra_roots(
+        roots: &[pki_types::CertificateDer<'static>],
+    ) -> Result<Self, TlsError> {
+        use windows_sys::Win32::Security::Cryptography::CertCreateCertificateChainEngine;
+
+        let mut inner = Self::new()?;
+        // Extra roots store
+        let mut additional_store = CertificateStore::new()?;
+        for root in roots {
+            additional_store.add_cert(root)?;
+        }
+        print_cert_store(additional_store.inner.as_ptr());
+
+        // System sore
+        let mut pvpara: Vec<_> = "root".encode_utf16().collect();
+        pvpara.push(0);
+        let system_store = unsafe { CertOpenSystemStoreW(0, pvpara.as_ptr()) };
+        let collection = unsafe {
+            CertOpenStore(
+                CERT_STORE_PROV_COLLECTION,
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                0,
+                CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
+                ptr::null(), //must be null in that case
+            )
+        };
+        unsafe {
+            CertAddStoreToCollection(
+                collection,
+                system_store,
+                CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG,
+                0,
+            )
+        };
+        unsafe {
+            CertAddStoreToCollection(
+                collection,
+                additional_store.inner.as_ptr(),
+                CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG,
+                0,
+            )
+        };
+
+        let mut config = CERT_CHAIN_ENGINE_CONFIG::zeroed_with_size();
+        config.hExclusiveRoot = collection;
+
+        let mut engine = 0;
+        // SAFETY: `engine` is valid to be written to and the config is valid to be read.
+        let res = unsafe { CertCreateCertificateChainEngine(&config, &mut engine) };
+
+        #[allow(clippy::as_conversions)]
+        let engine = call_with_last_error(|| match NonNull::new(engine as *mut c_void) {
+            Some(c) if res == TRUE => Some(c),
+            _ => None,
+        })?;
+        inner.engine = Some(engine);
+
+        Ok(inner)
     }
 
     #[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
@@ -441,6 +502,9 @@ pub struct Verifier {
     #[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
     test_only_root_ca_override: Option<Vec<u8>>,
     pub(super) crypto_provider: OnceCell<Arc<CryptoProvider>>,
+    /// Extra trust anchors to add to the verifier above and beyond those provided by
+    /// the system-provided trust stores.
+    extra_roots: Vec<pki_types::CertificateDer<'static>>,
 }
 
 impl Verifier {
@@ -455,6 +519,22 @@ impl Verifier {
             #[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
             test_only_root_ca_override: None,
             crypto_provider: OnceCell::new(),
+            extra_roots: Vec::new(),
+        }
+    }
+
+    /// Creates a new instance of a TLS certificate verifier that utilizes the
+    /// Windows certificate facilities and augmented by the provided extra root certificates.
+    ///
+    /// A [`CryptoProvider`] must be set with
+    /// [`set_provider`][Verifier::set_provider]/[`with_provider`][Verifier::with_provider] or
+    /// [`CryptoProvider::install_default`] before the verifier can be used.
+    pub fn new_with_extra_roots(roots: Vec<pki_types::CertificateDer<'static>>) -> Self {
+        Self {
+            #[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
+            test_only_root_ca_override: None,
+            crypto_provider: OnceCell::new(),
+            extra_roots: roots.into_iter().map(Into::into).collect::<Vec<_>>(),
         }
     }
 
@@ -464,6 +544,7 @@ impl Verifier {
         Self {
             test_only_root_ca_override: Some(root.into()),
             crypto_provider: OnceCell::new(),
+            extra_roots: Vec::new(),
         }
     }
 
@@ -483,11 +564,11 @@ impl Verifier {
             Some(test_only_root_ca_override) => {
                 CertificateStore::new_with_fake_root(test_only_root_ca_override)?
             }
-            None => CertificateStore::new()?,
+            None => CertificateStore::new_with_extra_roots(&self.extra_roots)?,
         };
 
         #[cfg(not(any(test, feature = "ffi-testing", feature = "dbg")))]
-        let mut store = CertificateStore::new()?;
+        let mut store = CertificateStore::new_with_extra_roots(&self.extra_roots)?;
 
         let mut primary_cert = store.add_cert(primary_cert)?;
 
@@ -521,7 +602,7 @@ impl Verifier {
             .collect();
 
         let cert_chain = store.new_chain_in(&primary_cert, now)?;
-
+        print_cert_chain_status(&cert_chain);
         let status = cert_chain.verify_chain_policy(server)?;
 
         if status.dwError == 0 {
