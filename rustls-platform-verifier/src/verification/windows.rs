@@ -286,11 +286,33 @@ impl CertificateStore {
             additional_store.add_cert(root)?;
         }
 
+        // open the system store
+        // let mut pvpara: Vec<_> = "Root".encode_utf16().collect();
+        // pvpara.push(0);
+
+        // let _system_store = call_with_last_error(|| {
+        //     // SAFETY: Called with valid constants and result is checked to be non-null.
+        //     // The `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG` flag is critical;
+        //     // see the `CertificateStore` documentation for more info.
+        //     NonNull::new(unsafe {
+        //         CertOpenStore(
+        //             CERT_STORE_PROV_SYSTEM_W,
+        //             0, // Set to zero since this uses `PROV_MEMORY`.
+        //             0, // This field shouldn't be used.
+        //             CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG | CERT_SYSTEM_STORE_CURRENT_USER_ID,
+        //             pvpara.as_ptr() as *const c_void,
+        //         )
+        //     })
+        // })?;
+
         let mut config = CERT_CHAIN_ENGINE_CONFIG::zeroed_with_size();
+
         config.rghAdditionalStore = &mut additional_store.inner.as_ptr();
         config.cAdditionalStore = 1;
+        // config.hRestrictedRoot = additional_store.inner.as_ptr();
+        // config.dwFlags = CERT_CHAIN_ENABLE_SHARE_STORE | CERT_CHAIN_ENABLE_CACHE_AUTO_UPDATE;
 
-        println!("additionnal cert store content:");
+        println!("additonal store of the cert engine");
         print_cert_store(unsafe { *config.rghAdditionalStore });
 
         let mut engine = 0;
@@ -578,6 +600,8 @@ impl Verifier {
 
         let cert_chain = store.new_chain_in(&primary_cert, now)?;
         print_cert_chain_status(&cert_chain);
+        println!("Store after building the chain");
+        print_cert_store(store.inner.as_ptr());
         let status = cert_chain.verify_chain_policy(server)?;
 
         if status.dwError == 0 {
