@@ -35,8 +35,10 @@ use std::{
     sync::Arc,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChainEngine,
-    CertGetNameStringW, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+    CertAddStoreToCollection, CertCloseStore, CertEnumCertificatesInStore,
+    CertFreeCertificateChainEngine, CertGetNameStringW, CertOpenSystemStoreW,
+    CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG, CERT_STORE_PROV_COLLECTION,
+    PKCS_7_ASN_ENCODING,
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -286,34 +288,87 @@ impl CertificateStore {
             additional_store.add_cert(root)?;
         }
 
-        // open the system store
-        // let mut pvpara: Vec<_> = "Root".encode_utf16().collect();
-        // pvpara.push(0);
+        //////////  Try to  open the system store directly ///////////
+        let mut pvpara: Vec<_> = "root".encode_utf16().collect();
+        pvpara.push(0);
 
-        // let _system_store = call_with_last_error(|| {
+        // let pvpara: Vec<u16> = b"root"
+        //     .iter()
+        //     .map(|c| u16::from(*c))
+        //     .chain(Some(0))
+        //     .collect();
+        //  CertOpenStore(
+        //                         CERT_STORE_PROV_SYSTEM_W,
+        //                         X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        //                         NULL,
+        //                         dwStoreFlags |
+        //                             CERT_STORE_MAXIMUM_ALLOWED_FLAG,
+        //                         L"root"
+        //                         );
+        // let system_store = call_with_last_error(|| {
         //     // SAFETY: Called with valid constants and result is checked to be non-null.
         //     // The `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG` flag is critical;
         //     // see the `CertificateStore` documentation for more info.
         //     NonNull::new(unsafe {
         //         CertOpenStore(
         //             CERT_STORE_PROV_SYSTEM_W,
-        //             0, // Set to zero since this uses `PROV_MEMORY`.
+        //             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
         //             0, // This field shouldn't be used.
-        //             CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG | CERT_SYSTEM_STORE_CURRENT_USER_ID,
+        //             CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
         //             pvpara.as_ptr() as *const c_void,
         //         )
         //     })
         // })?;
+        let system_store = unsafe { CertOpenSystemStoreW(0, pvpara.as_ptr()) };
+        let collection = unsafe {
+            CertOpenStore(
+                CERT_STORE_PROV_COLLECTION,
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                0,
+                CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG,
+                ptr::null(), //must be null in that case
+            )
+        };
+        unsafe {
+            CertAddStoreToCollection(
+                collection,
+                system_store,
+                CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG,
+                0,
+            )
+        };
+        unsafe {
+            CertAddStoreToCollection(
+                collection,
+                additional_store.inner.as_ptr(),
+                CERT_PHYSICAL_STORE_ADD_ENABLE_FLAG,
+                0,
+            )
+        };
 
         let mut config = CERT_CHAIN_ENGINE_CONFIG::zeroed_with_size();
+        config.hExclusiveRoot = collection;
 
-        config.rghAdditionalStore = &mut additional_store.inner.as_ptr();
-        config.cAdditionalStore = 1;
+        // config.rghAdditionalStore = &mut system_store.as_ptr();
+        // config.rghAdditionalStore = &mut additional_store.inner.as_ptr();
+        // config.cAdditionalStore = 1;
+
+        assert_eq!(config.hRestrictedTrust, ptr::null_mut());
+        assert_eq!(config.hRestrictedOther, ptr::null_mut());
+        assert_eq!(config.hRestrictedRoot, ptr::null_mut());
+        // assert_eq!(config.hExclusiveRoot, ptr::null_mut());
+        assert_eq!(config.hExclusiveTrustedPeople, ptr::null_mut());
+
+        // config.hExclusiveRoot = additional_store.inner.as_ptr();
         // config.hRestrictedRoot = additional_store.inner.as_ptr();
         // config.dwFlags = CERT_CHAIN_ENABLE_SHARE_STORE | CERT_CHAIN_ENABLE_CACHE_AUTO_UPDATE;
+        // config.dwFlags = CERT_CHAIN_ENABLE_SHARE_STORE
+        //     | CERT_CHAIN_ENABLE_CACHE_AUTO_UPDATE
+        //     | CERT_CHAIN_ONLY_ADDITIONAL_AND_AUTH_ROOT;
+        // config.dwFlags = CERT_CHAIN_ONLY_ADDITIONAL_AND_AUTH_ROOT;
 
-        println!("additonal store of the cert engine");
-        print_cert_store(unsafe { *config.rghAdditionalStore });
+        // println!("additonal store of the cert engine");
+        // print_cert_store(unsafe { *config.rghAdditionalStore });
 
         let mut engine = 0;
         // SAFETY: `engine` is valid to be written to and the config is valid to be read.
