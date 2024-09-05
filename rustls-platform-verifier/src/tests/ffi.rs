@@ -151,6 +151,7 @@ mod dummy {
             windows,
             target_os = "android",
             target_os = "macos",
+            target_os = "ios",
             target_os = "linux"
         ))]
         let _ = tests::verification_mock::ALL_TEST_CASES;

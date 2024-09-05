@@ -184,7 +184,20 @@ jobs:
             ./android/emulator.log
             /Users/runner/work/rustls-platform-verifier/rustls-platform-verifier/android/rustls-platform-verifier/build/outputs/androidTest-results/connected/test-result.pb
 
-  # TODO: Test iOS in CI too.
+  test-ios-aarch64:
+    name: Test (iOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        id: toolchain
+        with:
+          toolchain: stable
+          target: aarch64-apple-ios-sim
+      - name: Install bash
+        run: brew install bash
+      - name: iOS Simulator Runner
+        run: ./ci/ios-simulator-runner.sh
 
   test-freebsd:
     name: Test (FreeBSD)
